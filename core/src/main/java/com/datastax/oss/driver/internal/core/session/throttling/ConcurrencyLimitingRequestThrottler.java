@@ -25,7 +25,6 @@ import com.datastax.oss.driver.api.core.session.throttling.RequestThrottler;
 import com.datastax.oss.driver.api.core.session.throttling.Throttled;
 import com.datastax.oss.driver.shaded.guava.common.annotations.VisibleForTesting;
 import edu.umd.cs.findbugs.annotations.NonNull;
-import edu.umd.cs.findbugs.annotations.Nullable;
 import java.util.Deque;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -66,6 +65,7 @@ public class ConcurrencyLimitingRequestThrottler implements RequestThrottler {
   private final Deque<Throttled> queue = new ConcurrentLinkedDeque<>();
   private final AtomicInteger queueSize = new AtomicInteger(0);
   private volatile boolean closed = false;
+  private static final ThreadLocal<Boolean> isNested = ThreadLocal.withInitial(() -> Boolean.FALSE);
 
   public ConcurrencyLimitingRequestThrottler(DriverContext context) {
     this.logPrefix = context.getSessionName();
@@ -137,10 +137,7 @@ public class ConcurrencyLimitingRequestThrottler implements RequestThrottler {
 
   @Override
   public void signalSuccess(@NonNull Throttled request) {
-    Throttled nextRequest = onRequestDoneAndDequeNext();
-    if (nextRequest != null) {
-      nextRequest.onThrottleReady(true);
-    }
+    onRequestDone();
   }
 
   @Override
@@ -150,53 +147,70 @@ public class ConcurrencyLimitingRequestThrottler implements RequestThrottler {
 
   @Override
   public void signalTimeout(@NonNull Throttled request) {
-    Throttled nextRequest = null;
     if (!closed) {
       if (queue.remove(request)) { // The request timed out before it was active
         queueSize.decrementAndGet();
         LOG.trace("[{}] Removing timed out request from the queue", logPrefix);
       } else {
-        nextRequest = onRequestDoneAndDequeNext();
+        onRequestDone();
       }
-    }
-
-    if (nextRequest != null) {
-      nextRequest.onThrottleReady(true);
     }
   }
 
   @Override
   public void signalCancel(@NonNull Throttled request) {
-    Throttled nextRequest = null;
     if (!closed) {
       if (queue.remove(request)) { // The request has been cancelled before it was active
         queueSize.decrementAndGet();
         LOG.trace("[{}] Removing cancelled request from the queue", logPrefix);
       } else {
-        nextRequest = onRequestDoneAndDequeNext();
+        onRequestDone();
       }
-    }
-
-    if (nextRequest != null) {
-      nextRequest.onThrottleReady(true);
     }
   }
 
-  @Nullable
-  private Throttled onRequestDoneAndDequeNext() {
-    if (!closed) {
-      Throttled nextRequest = queue.poll();
-      if (nextRequest == null) {
-        concurrentRequests.decrementAndGet();
-      } else {
-        queueSize.decrementAndGet();
-        LOG.trace("[{}] Starting dequeued request", logPrefix);
-        return nextRequest;
-      }
+  private void onRequestDone() {
+    // release slot - technically we could hold it but the code is tricky
+    // and, we get a chance to release it and have some other thread work
+    concurrentRequests.decrementAndGet();
+
+    // we explicitly track nesting and loop to avoid a situation of an
+    // endless queue leading to an endless stack; we use a threadlocal
+    // to track nesting, and, if we see recursion we unwind and use the loop
+    if (isNested.get()) {
+      return;
     }
 
-    // no next task was dequeued
-    return null;
+    try {
+      isNested.set(Boolean.TRUE);
+      while (!closed) {
+        // the loop might issue _many_ 'onThrottleReady' requests, so we
+        // must confirm explicitly for each request that there is capacity
+        int newConcurrent = concurrentRequests.incrementAndGet();
+        if (newConcurrent > maxConcurrentRequests) {
+          // if over-limit then release what we claimed
+          concurrentRequests.decrementAndGet();
+          break;
+        }
+
+        // poll for a task
+        Throttled nextRequest = queue.poll();
+        if (nextRequest == null) {
+          // if no task then release what we claimed
+          concurrentRequests.decrementAndGet();
+          break;
+        } else {
+          // found a task
+          queueSize.decrementAndGet();
+        }
+
+        LOG.trace("[{}] Starting dequeued request", logPrefix);
+        nextRequest.onThrottleReady(true);
+        // if call was nested, the stack will unwind to here, so check for more
+      }
+    } finally {
+      isNested.remove();
+    }
   }
 
   @Override

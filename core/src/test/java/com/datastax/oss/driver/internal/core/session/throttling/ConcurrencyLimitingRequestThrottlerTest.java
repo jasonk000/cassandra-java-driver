@@ -363,4 +363,82 @@ public class ConcurrencyLimitingRequestThrottlerTest {
       threads[i].join(1_000);
     }
   }
+
+  @Test
+  public void should_not_callback_to_infinite_depth() throws InterruptedException {
+    // Given
+    // Reset the static counters
+    NestDetectingThrottled.reset();
+
+    // Create many NestDetectingThrottled instances
+    final int MANY_REQUESTS = 10;
+
+    // Fill up the throttler to capacity first (5 concurrent requests)
+    MockThrottled[] activeRequests = new MockThrottled[5];
+    for (int i = 0; i < 5; i++) {
+      activeRequests[i] = new MockThrottled();
+      throttler.register(activeRequests[i]);
+    }
+
+    // Now enqueue many NestDetectingThrottled requests that will be queued
+    CountDownLatch latch = new CountDownLatch(MANY_REQUESTS);
+    for (int i = 0; i < MANY_REQUESTS; i++) {
+      NestDetectingThrottled request = new NestDetectingThrottled(throttler, latch);
+      throttler.register(request);
+    }
+
+    // Verify they are all queued
+    assertThat(throttler.getQueue()).hasSize(MANY_REQUESTS);
+    assertThat(NestDetectingThrottled.sawNested).isFalse();
+
+    // When
+    // Signal success on one of the active requests to start the cascade
+    throttler.signalSuccess(activeRequests[0]);
+
+    // Wait for all queued requests to be processed
+    latch.await();
+
+    // Then
+    // Verify that no nesting was detected during the cascade of callbacks
+    assertThat(NestDetectingThrottled.sawNested).isFalse();
+    assertThat(throttler.getQueue()).isEmpty();
+  }
+
+  static class NestDetectingThrottled implements Throttled {
+    static int countNested = 0;
+    static boolean sawNested = false;
+
+    final ConcurrencyLimitingRequestThrottler throttler;
+    final CountDownLatch latch;
+
+    NestDetectingThrottled(ConcurrencyLimitingRequestThrottler throttler, CountDownLatch latch) {
+      this.throttler = throttler;
+      this.latch = latch;
+    }
+
+    @Override
+    public void onThrottleReady(boolean wasDelayed) {
+      if (countNested > 0) {
+        sawNested = true;
+      }
+
+      countNested++;
+      throttler.signalSuccess(this);
+      countNested--;
+
+      latch.countDown();
+    }
+
+    @Override
+    public void onThrottleFailure(RequestThrottlingException error) {
+      if (countNested > 0) {
+        sawNested = true;
+      }
+    }
+
+    public static void reset() {
+      countNested = 0;
+      sawNested = false;
+    }
+  }
 }
