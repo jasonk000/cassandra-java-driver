@@ -52,7 +52,6 @@ import org.slf4j.LoggerFactory;
  */
 @ThreadSafe
 public class ConcurrencyLimitingRequestThrottler implements RequestThrottler {
-
   private static final Logger LOG =
       LoggerFactory.getLogger(ConcurrencyLimitingRequestThrottler.class);
 
@@ -92,13 +91,21 @@ public class ConcurrencyLimitingRequestThrottler implements RequestThrottler {
     // could read transiently over the limit, but the queue itself will never grow
     // beyond the limit since we always check for that condition and revert if
     // over-limit. We do this instead of a CAS-loop to avoid the potential loop.
+    //
+    // This mandates that we are cautious about the order of events when we add or remove
+    // from the queues and keep related state aligned. There must be no intervening
+    // operations including logging, between the numerical updates and the queue work.
+    // (Real example - what if the logger throws at random?)
 
     // If no backlog exists AND we get capacity, we can execute immediately
     if (queueSize.get() == 0) {
       // Take a claim first, and then check if we are OK to proceed
       int newConcurrent = concurrentRequests.incrementAndGet();
       if (newConcurrent <= maxConcurrentRequests) {
-        LOG.trace("[{}] Starting newly registered request", logPrefix);
+        traceWithUnwind(
+            "[{}] Starting newly registered request",
+            logPrefix,
+            concurrentRequests::decrementAndGet);
         request.onThrottleReady(false);
         return;
       } else {
@@ -110,8 +117,8 @@ public class ConcurrencyLimitingRequestThrottler implements RequestThrottler {
     // If we have a backlog, or we failed to claim capacity, try to enqueue
     int newQueueSize = queueSize.incrementAndGet();
     if (newQueueSize <= maxQueueSize) {
-      LOG.trace("[{}] Enqueuing request", logPrefix);
       queue.offer(request);
+      LOG.trace("[{}] Enqueued request", logPrefix);
 
       // Double-check that we were still supposed to be enqueued; it is possible
       // that the session was closed while we were enqueuing, it's also possible
@@ -124,8 +131,8 @@ public class ConcurrencyLimitingRequestThrottler implements RequestThrottler {
         }
       }
     } else {
-      LOG.trace("[{}] Rejecting request because of full queue", logPrefix);
       queueSize.decrementAndGet();
+      LOG.trace("[{}] Rejecting request because of full queue", logPrefix);
       fail(
           request,
           String.format(
@@ -204,7 +211,10 @@ public class ConcurrencyLimitingRequestThrottler implements RequestThrottler {
           queueSize.decrementAndGet();
         }
 
-        LOG.trace("[{}] Starting dequeued request", logPrefix);
+        traceWithUnwind(
+            "[{}] Starting dequeued request",
+            logPrefix,
+            concurrentRequests::decrementAndGet);
         nextRequest.onThrottleReady(true);
         // if call was nested, the stack will unwind to here, so check for more
       }
@@ -241,5 +251,20 @@ public class ConcurrencyLimitingRequestThrottler implements RequestThrottler {
 
   private static void fail(Throttled request, String message) {
     request.onThrottleFailure(new RequestThrottlingException(message));
+  }
+
+  /**
+   * Perform a trace to logger, with a compensating action if the logger throws.
+   *
+   * <p>Internal utility to support situations when the logger is not expected to throw, but if it
+   * does, then we need to unwind some state before bubbling the exception.
+   */
+  void traceWithUnwind(String msg, String str1, Runnable unwind) {
+    try {
+      LOG.trace(msg, str1);
+    } catch (Throwable t) {
+      unwind.run();
+      throw t;
+    }
   }
 }

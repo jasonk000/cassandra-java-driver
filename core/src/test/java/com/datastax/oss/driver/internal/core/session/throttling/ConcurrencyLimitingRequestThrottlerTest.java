@@ -28,14 +28,18 @@ import com.datastax.oss.driver.api.core.config.DriverExecutionProfile;
 import com.datastax.oss.driver.api.core.context.DriverContext;
 import com.datastax.oss.driver.api.core.session.throttling.Throttled;
 import com.datastax.oss.driver.shaded.guava.common.collect.Lists;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.function.Consumer;
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnitRunner;
+import org.slf4j.Logger;
 
 @RunWith(MockitoJUnitRunner.class)
 public class ConcurrencyLimitingRequestThrottlerTest {
@@ -43,6 +47,8 @@ public class ConcurrencyLimitingRequestThrottlerTest {
   @Mock private DriverContext context;
   @Mock private DriverConfig config;
   @Mock private DriverExecutionProfile defaultProfile;
+
+  private static Logger originalLogger;
 
   private ConcurrencyLimitingRequestThrottler throttler;
 
@@ -402,6 +408,123 @@ public class ConcurrencyLimitingRequestThrottlerTest {
     // Verify that no nesting was detected during the cascade of callbacks
     assertThat(NestDetectingThrottled.sawNested).isFalse();
     assertThat(throttler.getQueue()).isEmpty();
+  }
+
+  @Test
+  public void should_maintain_consistent_state_when_logger_throws_empty() {
+    // enable throwing errors
+    replaceLogger();
+
+    // First, register requests normally (without logging exceptions) to fill capacity
+    MockThrottled throttled = new MockThrottled();
+    try {
+      throttler.register(throttled);
+      assertThat(true).isEqualTo(false);
+    } catch (RuntimeException e) {
+      // should have gotten here, since logger would throw
+    }
+
+    // Verify the request was never submitted but queuesize matches
+    assertThat(throttler.getConcurrentRequests()).isEqualTo(0);
+    assertThat(throttler.getQueue()).size().isEqualTo(0);
+    assertThat(throttler.getQueueSize()).isEqualTo(0);
+    assertThatStage(throttled.started).isNotDone();
+  }
+
+  @Test
+  public void should_maintain_consistent_state_when_logger_throws_full() {
+    // Create a custom throttler with a logger that throws exceptions
+    // First, register requests normally (without logging exceptions) to fill capacity
+    MockThrottled[] activeRequests = new MockThrottled[15];
+    for (int i = 0; i < 5; i++) {
+      activeRequests[i] = new MockThrottled();
+      throttler.register(activeRequests[i]);
+      assertThatStage(activeRequests[i].ended)
+          .isSuccess(wasDelayed -> assertThat(wasDelayed).isFalse());
+    }
+
+    // Fill queue capacity
+    for (int i = 5; i < 15; i++) {
+      activeRequests[i] = new MockThrottled();
+      throttler.register(activeRequests[i]);
+    }
+
+    // Verify we're at capacity
+    assertThat(throttler.getConcurrentRequests()).isEqualTo(5);
+    assertThat(throttler.getQueue()).size().isEqualTo(10);
+    assertThat(throttler.getQueueSize()).isEqualTo(10);
+
+    // Now enable logging exceptions and complete one request to test state
+    replaceLogger();
+
+    // Enqueue an additional element that will go into queue
+    MockThrottled lastRequest = new MockThrottled();
+    try {
+      throttler.register(lastRequest);
+      assertThat(true).isEqualTo(false);
+    } catch (RuntimeException e) {
+      assertThat(e).hasMessage("exception for testing");
+    }
+
+    // Even though exception was thrown, state should be consistent because unwind ran
+    // The enqueued request should have been started successfully
+    assertThat(throttler.getConcurrentRequests()).isEqualTo(5);
+    assertThat(throttler.getQueue().size()).isEqualTo(10);
+    assertThat(throttler.getQueueSize()).isEqualTo(10);
+  }
+
+  static void replaceLogger() {
+    try {
+      Field logField = ConcurrencyLimitingRequestThrottler.class.getDeclaredField("LOG");
+      logField.setAccessible(true);
+
+      Field modifiersField = Field.class.getDeclaredField("modifiers");
+      modifiersField.setAccessible(true);
+      modifiersField.setInt(logField, logField.getModifiers() & ~Modifier.FINAL);
+
+      originalLogger = (Logger) logField.get(null);
+
+      RuntimeException testException = new RuntimeException("exception for testing");
+
+      Logger mockLogger =
+          org.mockito.Mockito.mock(
+              Logger.class,
+              org.mockito.Mockito.withSettings()
+                  .defaultAnswer(
+                      invocation -> {
+                        String m = invocation.getMethod().getName();
+                        switch (m) {
+                          case "isTraceEnabled":
+                          case "isDebugEnabled":
+                            return true;
+                          case "getName":
+                            return "MockLogger";
+                          case "trace":
+                          case "debug":
+                            throw testException; // throw for any args/overload
+                          default:
+                            return org.mockito.Answers.RETURNS_DEFAULTS.get().answer(invocation);
+                        }
+                      }));
+
+      logField.set(null, mockLogger);
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to replace logger", e);
+    }
+  }
+
+  @After
+  public void restoreLogger() {
+    try {
+      if (originalLogger != null) {
+        Field logField = ConcurrencyLimitingRequestThrottler.class.getDeclaredField("LOG");
+        logField.setAccessible(true);
+        logField.set(null, originalLogger);
+        originalLogger = null;
+      }
+    } catch (Exception e) {
+      throw new RuntimeException("Failed to restore logger", e);
+    }
   }
 
   static class NestDetectingThrottled implements Throttled {
